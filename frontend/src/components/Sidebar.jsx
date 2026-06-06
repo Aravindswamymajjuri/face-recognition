@@ -1,12 +1,14 @@
 import { NavLink } from 'react-router-dom';
-import { Activity, Camera, ClipboardList, LayoutDashboard, Settings, ScanFace } from 'lucide-react';
+import { Activity, Camera, ChartColumnBig, ClipboardList, LayoutDashboard, Settings, ScanFace } from 'lucide-react';
 
 const navItems = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard },
   { to: '/live', label: 'Live Attendance', icon: Camera },
   { to: '/register', label: 'Register Face', icon: ScanFace },
   { to: '/records', label: 'Attendance Records', icon: ClipboardList },
+  { to: '/monthly-report', label: 'Monthly Report', icon: ChartColumnBig },
   { to: '/settings', label: 'Settings', icon: Settings },
+  { to: '/holidays', label: 'Holidays', icon: Activity },
 ];
 
 export default function Sidebar() {

@@ -82,10 +82,51 @@ class SettingsResponse(BaseModel):
     departments: List[str]
 
 
+# class SettingsUpdate(BaseModel):
+#     confidence_threshold: float = Field(ge=0.0, le=1.0)
+#     match_margin: float = Field(ge=0.0, le=1.0)
+#     working_hours_start: str
+#     working_hours_end: str
+#     late_after_minutes: int = Field(ge=0)
+#     departments: List[str]
+
+# schemas.py
 class SettingsUpdate(BaseModel):
     confidence_threshold: float = Field(ge=0.0, le=1.0)
-    match_margin: float = Field(ge=0.0, le=1.0)
+    match_margin: float = Field(default=0.05, ge=0.0, le=1.0)  # ← add default
     working_hours_start: str
     working_hours_end: str
     late_after_minutes: int = Field(ge=0)
     departments: List[str]
+
+
+class MonthlyAttendanceReportItem(BaseModel):
+    employee_id: str
+    name: str
+    department: str
+    total_working_days: int
+    present_days: int
+    late_days: int
+    absent_days: int
+    attendance_percentage: float
+
+
+class MonthlyAttendanceReportSummary(BaseModel):
+    total_employees: int
+    average_attendance_percentage: float
+    perfect_attendance_count: int
+    below_75_count: int
+
+
+class MonthlyAttendanceReportResponse(BaseModel):
+    month: int
+    year: int
+    department: str | None = None
+    total_working_days: int
+    items: List[MonthlyAttendanceReportItem]
+    summary: MonthlyAttendanceReportSummary
+
+class Holiday(BaseModel):
+    date: str
+    name: str
+    holiday_type: str = "public"

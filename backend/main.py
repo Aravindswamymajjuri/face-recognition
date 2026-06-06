@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import calendar
 from datetime import date, datetime, time, timedelta, timezone
+from collections import defaultdict
 from math import ceil
 from typing import Any
 
@@ -23,6 +25,9 @@ from face_service import (
 from schemas import (
     AttendanceItem,
     AttendancePage,
+    MonthlyAttendanceReportItem,
+    MonthlyAttendanceReportResponse,
+    MonthlyAttendanceReportSummary,
     RecognizeRequest,
     RecognizeResponse,
     RecentCheckIn,
@@ -31,6 +36,7 @@ from schemas import (
     SettingsResponse,
     SettingsUpdate,
     TodayStats,
+    Holiday,
 )
 
 
@@ -75,6 +81,10 @@ def attendance_collection(db: Database) -> Collection[dict[str, Any]]:
 
 def settings_collection(db: Database) -> Collection[dict[str, Any]]:
     return db["settings"]
+
+
+def holidays_collection(db: Database) -> Collection[dict[str, Any]]:
+    return db["holidays"]
 
 
 def serialize_settings(settings: dict[str, Any]) -> SettingsResponse:
@@ -197,7 +207,6 @@ def register_face(payload: RegisterRequest, db: Database = Depends(get_db)) -> R
                 detail=f"Image {i + 1} failed: {str(exc)}",
             ) from exc
 
-    # Validate embeddings are consistent across angles
     if len(embeddings) >= 2:
         similarities = []
         for j in range(len(embeddings)):
@@ -212,6 +221,36 @@ def register_face(payload: RegisterRequest, db: Database = Depends(get_db)) -> R
             )
 
     averaged_embedding = average_embeddings(embeddings)
+
+    existing_employees = list(employees_collection(db).find(
+        {"employee_id": {"$ne": payload.employee_id}}
+    ))
+
+    if existing_employees:
+        candidate_pool = [
+            (doc["employee_id"], embedding_from_json(doc["embedding_vector"]))
+            for doc in existing_employees
+        ]
+        top_matches = top_k_matches(averaged_embedding, candidate_pool, k=1)
+
+        if top_matches:
+            best_id, best_score = top_matches[0]
+            threshold = float(settings.get("confidence_threshold", 0.60))
+            print(f"🔍 Face similarity check — best match: {best_id} with score {best_score:.3f} (threshold: {threshold})")
+
+            if best_score >= threshold:
+                matched_doc = next(
+                    (doc for doc in existing_employees if doc["employee_id"] == best_id), None
+                )
+                matched_name = matched_doc["name"] if matched_doc else best_id
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"This face is already registered as '{matched_name}' "
+                        f"(ID: {best_id}). Duplicate face registrations are not allowed."
+                    ),
+                )
+
     employees = employees_collection(db)
     now = utc_now()
 
@@ -248,12 +287,11 @@ def register_face(payload: RegisterRequest, db: Database = Depends(get_db)) -> R
 
 
 # ---------------------------------------------------------------------------
-# Recognize  ✅ THIS WAS COMMENTED OUT — NOW RESTORED
+# Recognize
 # ---------------------------------------------------------------------------
 
 @app.post("/api/recognize", response_model=RecognizeResponse)
 def recognize_face(payload: RecognizeRequest, db: Database = Depends(get_db)) -> RecognizeResponse:
-    # Step 1 — decode and embed
     try:
         image = decode_base64_image(payload.image)
         candidate_embedding = get_face_embedding(image)
@@ -268,7 +306,6 @@ def recognize_face(payload: RecognizeRequest, db: Database = Depends(get_db)) ->
     if not employee_docs:
         return RecognizeResponse(status="unknown", timestamp=utc_now())
 
-    # Step 2 — build candidate pool and get top-k matches
     candidate_pool = [
         (doc["employee_id"], embedding_from_json(doc["embedding_vector"]))
         for doc in employee_docs
@@ -281,26 +318,21 @@ def recognize_face(payload: RecognizeRequest, db: Database = Depends(get_db)) ->
 
     best_employee_id, best_score = top_matches[0]
 
-    # Step 3 — hard threshold check
     if best_score < threshold:
         print(f"❌ Rejected: score {best_score:.3f} below threshold {threshold}")
         return RecognizeResponse(status="unknown", confidence=float(best_score), timestamp=utc_now())
 
-    # Step 4 — margin check
     if len(top_matches) > 1:
-        # Multiple employees: ensure clear separation from second-best
         second_score = top_matches[1][1]
         if (best_score - second_score) < margin:
             print(f"❌ Rejected: margin {best_score - second_score:.3f} below required {margin}")
             return RecognizeResponse(status="unknown", confidence=float(best_score), timestamp=utc_now())
     else:
-        # Single employee: apply a stricter absolute threshold (0.70)
         strict_threshold = max(threshold, 0.70)
         if best_score < strict_threshold:
             print(f"❌ Rejected (single employee): score {best_score:.3f} below strict threshold {strict_threshold}")
             return RecognizeResponse(status="unknown", confidence=float(best_score), timestamp=utc_now())
 
-    # Step 5 — log attendance
     employee = next(doc for doc in employee_docs if doc["employee_id"] == best_employee_id)
     attendance_status, logged_timestamp = log_attendance(db, employee, float(best_score), settings)
 
@@ -379,6 +411,195 @@ def get_attendance_records(
 
 
 # ---------------------------------------------------------------------------
+# Monthly Report
+# ---------------------------------------------------------------------------
+
+@app.get("/api/attendance/monthly-report", response_model=MonthlyAttendanceReportResponse)
+def get_monthly_attendance_report(
+    month: int = Query(..., ge=1, le=12),
+    year: int = Query(..., ge=1900, le=2100),
+    department: str | None = None,
+    db: Database = Depends(get_db),
+) -> MonthlyAttendanceReportResponse:
+    ensure_default_settings(db)
+
+    _, last_day = calendar.monthrange(year, month)
+
+    # All calendar days in the month
+    all_days_in_month = {
+        date(year, month, day).isoformat()
+        for day in range(1, last_day + 1)
+    }
+
+    # Fetch holidays and subtract from working days
+    holiday_docs = list(holidays_collection(db).find({
+        "date": {"$regex": f"^{year}-{month:02d}"}
+    }))
+    holiday_dates = {doc["date"] for doc in holiday_docs}
+    working_days_set = all_days_in_month - holiday_dates
+
+    # Only count days that have elapsed (don't count future days in current month)
+    today = date.today()
+    if year == today.year and month == today.month:
+        elapsed_days_set = {
+            d for d in working_days_set
+            if date.fromisoformat(d) <= today
+        }
+    else:
+        elapsed_days_set = working_days_set
+
+    total_working_days = len(elapsed_days_set)
+
+    employee_query: dict[str, Any] = {}
+    if department:
+        employee_query["department"] = department
+
+    employees = list(employees_collection(db).find(employee_query).sort("name", 1))
+
+    if not employees:
+        return MonthlyAttendanceReportResponse(
+            month=month, year=year, department=department,
+            total_working_days=total_working_days, items=[],
+            summary=MonthlyAttendanceReportSummary(
+                total_employees=0, average_attendance_percentage=0.0,
+                perfect_attendance_count=0, below_75_count=0,
+            ),
+        )
+
+    month_prefix = f"{year}-{month:02d}"
+    att_query: dict[str, Any] = {
+        "attendance_date": {"$regex": f"^{month_prefix}"},
+    }
+    if department:
+        att_query["department"] = department
+
+    monthly_docs = list(attendance_collection(db).find(att_query))
+    print(f"📊 Found {len(monthly_docs)} records for {month_prefix}")
+
+    attendance_by_employee: dict[str, dict[str, int]] = defaultdict(lambda: {"present": 0, "late": 0})
+
+    for doc in monthly_docs:
+        raw_date = doc.get("attendance_date", "")
+        attendance_date = raw_date[:10] if isinstance(raw_date, str) else ""
+
+        # Only count days that are elapsed working days (excludes holidays & future days)
+        if attendance_date not in elapsed_days_set:
+            continue
+
+        emp_id = str(doc.get("employee_id", "")).strip()
+        if not emp_id:
+            continue
+
+        status_value = str(doc.get("status", "present")).strip().lower()
+        if status_value == "late":
+            attendance_by_employee[emp_id]["late"] += 1
+        else:
+            attendance_by_employee[emp_id]["present"] += 1
+
+    print(f"   ✅ Lookup: {dict(attendance_by_employee)}")
+
+    items: list[MonthlyAttendanceReportItem] = []
+    attendance_percentages: list[float] = []
+
+    for employee in employees:
+        emp_id = str(employee.get("employee_id", "")).strip()
+        counts = attendance_by_employee.get(emp_id, {"present": 0, "late": 0})
+
+        present_days  = counts["present"]
+        late_days     = counts["late"]
+        attended_days = present_days + late_days
+        absent_days   = max(total_working_days - attended_days, 0)
+        attendance_percentage = (
+            round((attended_days / total_working_days) * 100.0, 1)
+            if total_working_days > 0 else 0.0
+        )
+
+        attendance_percentages.append(attendance_percentage)
+        items.append(MonthlyAttendanceReportItem(
+            employee_id=emp_id,
+            name=str(employee.get("name", "")),
+            department=str(employee.get("department", "")),
+            total_working_days=total_working_days,
+            present_days=present_days,
+            late_days=late_days,
+            absent_days=absent_days,
+            attendance_percentage=attendance_percentage,
+        ))
+
+    avg_pct = (
+        round(sum(attendance_percentages) / len(attendance_percentages), 1)
+        if attendance_percentages else 0.0
+    )
+
+    return MonthlyAttendanceReportResponse(
+        month=month, year=year, department=department,
+        total_working_days=total_working_days, items=items,
+        summary=MonthlyAttendanceReportSummary(
+            total_employees=len(items),
+            average_attendance_percentage=avg_pct,
+            perfect_attendance_count=sum(1 for v in attendance_percentages if v == 100.0),
+            below_75_count=sum(1 for v in attendance_percentages if v < 75.0),
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Holidays
+# ---------------------------------------------------------------------------
+
+@app.get("/api/holidays")
+def get_holidays(
+    year: int | None = None,
+    month: int | None = None,
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    query: dict[str, Any] = {}
+    if year and month:
+        query["date"] = {"$regex": f"^{year}-{month:02d}"}
+    elif year:
+        query["date"] = {"$regex": f"^{year}-"}
+
+    docs = list(holidays_collection(db).find(query).sort("date", 1))
+    return {
+        "holidays": [
+            {
+                "date": doc["date"],
+                "name": doc["name"],
+                "holiday_type": doc.get("holiday_type", "public"),
+            }
+            for doc in docs
+        ],
+        "total": len(docs),
+    }
+
+
+@app.post("/api/holidays", status_code=status.HTTP_201_CREATED)
+def add_holiday(payload: Holiday, db: Database = Depends(get_db)) -> dict[str, Any]:
+    collection = holidays_collection(db)
+    existing = collection.find_one({"date": payload.date})
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A holiday on {payload.date} already exists.",
+        )
+    collection.insert_one({
+        "date": payload.date,
+        "name": payload.name,
+        "holiday_type": payload.holiday_type,
+        "created_at": utc_now(),
+    })
+    return {"status": "created", "date": payload.date, "name": payload.name}
+
+
+@app.delete("/api/holidays/{holiday_date}")
+def delete_holiday(holiday_date: str, db: Database = Depends(get_db)) -> dict[str, Any]:
+    result = holidays_collection(db).delete_one({"date": holiday_date})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Holiday not found.")
+    return {"status": "deleted", "date": holiday_date}
+
+
+# ---------------------------------------------------------------------------
 # Stats
 # ---------------------------------------------------------------------------
 
@@ -447,20 +668,108 @@ def get_settings(db: Database = Depends(get_db)) -> SettingsResponse:
 def update_settings(payload: SettingsUpdate, db: Database = Depends(get_db)) -> SettingsResponse:
     collection = settings_collection(db)
     now = utc_now()
+
+    update_data = payload.model_dump()
+    update_data["updated_at"] = now
+
     collection.update_one(
         {"key": SETTINGS_KEY},
         {
-            "$set": {
-                "confidence_threshold": payload.confidence_threshold,
-                "match_margin": payload.match_margin,
-                "working_hours_start": payload.working_hours_start,
-                "working_hours_end": payload.working_hours_end,
-                "late_after_minutes": payload.late_after_minutes,
-                "departments": payload.departments,
-                "updated_at": now,
-            },
+            "$set": update_data,
             "$setOnInsert": {"key": SETTINGS_KEY},
         },
         upsert=True,
     )
     return serialize_settings(collection.find_one({"key": SETTINGS_KEY}))
+
+
+@app.get("/api/attendance/employee-detail")
+def get_employee_monthly_detail(
+    employee_id: str,
+    month: int = Query(..., ge=1, le=12),
+    year: int = Query(..., ge=1900, le=2100),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    _, last_day = calendar.monthrange(year, month)
+
+    # Days elapsed so far (don't show future days)
+    today = date.today()
+    if year == today.year and month == today.month:
+        elapsed_last_day = today.day
+    else:
+        elapsed_last_day = last_day
+
+    all_days = [
+        date(year, month, day).isoformat()
+        for day in range(1, elapsed_last_day + 1)
+    ]
+
+    # Fetch holidays
+    holiday_docs = list(holidays_collection(db).find({
+        "date": {"$regex": f"^{year}-{month:02d}"}
+    }))
+    holiday_dates = {doc["date"]: doc["name"] for doc in holiday_docs}
+
+    # Fetch this employee's attendance for the month
+    month_prefix = f"{year}-{month:02d}"
+    att_docs = list(attendance_collection(db).find({
+        "employee_id": employee_id,
+        "attendance_date": {"$regex": f"^{month_prefix}"},
+    }))
+
+    # Build lookup: date -> record
+    att_by_date = {
+        str(doc["attendance_date"])[:10]: doc
+        for doc in att_docs
+    }
+
+    # Fetch employee info
+    employee = employees_collection(db).find_one({"employee_id": employee_id})
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found.")
+
+    # Build day-wise breakdown
+    day_records = []
+    for day_str in all_days:
+        if day_str in holiday_dates:
+            day_records.append({
+                "date": day_str,
+                "status": "holiday",
+                "holiday_name": holiday_dates[day_str],
+                "check_in_time": None,
+                "confidence": None,
+            })
+        elif day_str in att_by_date:
+            doc = att_by_date[day_str]
+            ts = doc.get("timestamp")
+            check_in_time = ts.astimezone().strftime("%I:%M %p") if ts else None
+            day_records.append({
+                "date": day_str,
+                "status": doc.get("status", "present"),
+                "holiday_name": None,
+                "check_in_time": check_in_time,
+                "confidence": round(float(doc.get("confidence", 0)) * 100, 1),
+            })
+        else:
+            day_records.append({
+                "date": day_str,
+                "status": "absent",
+                "holiday_name": None,
+                "check_in_time": None,
+                "confidence": None,
+            })
+
+    working_days = [d for d in all_days if d not in holiday_dates]
+    attended = sum(1 for d in day_records if d["status"] in ("present", "late"))
+
+    return {
+        "employee_id": employee_id,
+        "name": str(employee.get("name", "")),
+        "department": str(employee.get("department", "")),
+        "month": month,
+        "year": year,
+        "total_elapsed_days": len(working_days),
+        "attended_days": attended,
+        "attendance_percentage": round((attended / len(working_days)) * 100, 1) if working_days else 0.0,
+        "days": day_records,
+    }

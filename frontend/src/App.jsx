@@ -3,9 +3,11 @@ import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import Sidebar from './components/Sidebar';
 import Dashboard from './pages/Dashboard';
 import LiveAttendance from './pages/LiveAttendance';
+import MonthlyReport from './pages/MonthlyReport';
 import RegisterFace from './pages/RegisterFace';
 import Records from './pages/Records';
 import Settings from './pages/Settings';
+import Holidays from './pages/Holidays';
 
 export default function App() {
   const location = useLocation();
@@ -25,7 +27,9 @@ export default function App() {
               <Route path="/live" element={<LiveAttendance />} />
               <Route path="/register" element={<RegisterFace />} />
               <Route path="/records" element={<Records />} />
+              <Route path="/monthly-report" element={<MonthlyReport />} />
               <Route path="/settings" element={<Settings />} />
+              <Route path="/holidays" element={<Holidays />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </AnimatePresence>
