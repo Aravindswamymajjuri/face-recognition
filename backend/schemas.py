@@ -19,6 +19,9 @@ class RecognizeResponse(BaseModel):
     confidence: Optional[float] = None
     timestamp: datetime
     department: Optional[str] = None
+    action: Optional[str] = None          # "check_in" | "check_out"
+    check_in_time: Optional[datetime] = None
+    check_out_time: Optional[datetime] = None
 
 
 class RegisterRequest(BaseModel):
@@ -45,6 +48,10 @@ class AttendanceItem(BaseModel):
     timestamp: datetime
     status: str
     confidence: float
+    action: Optional[str] = None          # "check_in" | "check_out"
+    check_in_time: Optional[datetime] = None
+    check_out_time: Optional[datetime] = None
+    work_duration_minutes: Optional[int] = None
 
 
 class AttendancePage(BaseModel):
@@ -62,6 +69,7 @@ class RecentCheckIn(BaseModel):
     status: str
     timestamp: datetime
     confidence: float
+    action: Optional[str] = None
 
 
 class TodayStats(BaseModel):
@@ -69,6 +77,7 @@ class TodayStats(BaseModel):
     present: int
     absent: int
     late: int
+    checked_out: int = 0
     recent_checkins: List[RecentCheckIn]
     weekly_trend: List[dict] = Field(default_factory=list)
 
@@ -82,18 +91,9 @@ class SettingsResponse(BaseModel):
     departments: List[str]
 
 
-# class SettingsUpdate(BaseModel):
-#     confidence_threshold: float = Field(ge=0.0, le=1.0)
-#     match_margin: float = Field(ge=0.0, le=1.0)
-#     working_hours_start: str
-#     working_hours_end: str
-#     late_after_minutes: int = Field(ge=0)
-#     departments: List[str]
-
-# schemas.py
 class SettingsUpdate(BaseModel):
     confidence_threshold: float = Field(ge=0.0, le=1.0)
-    match_margin: float = Field(default=0.05, ge=0.0, le=1.0)  # ← add default
+    match_margin: float = Field(default=0.05, ge=0.0, le=1.0)
     working_hours_start: str
     working_hours_end: str
     late_after_minutes: int = Field(ge=0)
@@ -125,6 +125,7 @@ class MonthlyAttendanceReportResponse(BaseModel):
     total_working_days: int
     items: List[MonthlyAttendanceReportItem]
     summary: MonthlyAttendanceReportSummary
+
 
 class Holiday(BaseModel):
     date: str

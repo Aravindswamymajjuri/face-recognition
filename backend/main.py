@@ -53,6 +53,9 @@ app.add_middleware(
 DEFAULT_DEPARTMENTS = ["Engineering", "HR", "Operations", "Security"]
 SETTINGS_KEY = "system"
 
+# Minimum minutes between check-in and check-out
+MIN_WORK_MINUTES = 30
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -116,6 +119,26 @@ def ensure_default_settings(db: Database) -> dict[str, Any]:
     return settings
 
 
+def is_within_working_hours(moment: datetime, settings: dict[str, Any]) -> tuple[bool, str]:
+    """
+    Returns (is_allowed, reason_if_not_allowed).
+    Checks if the current local time falls within configured working hours.
+    """
+    working_start = parse_time(str(settings.get("working_hours_start", "09:00")))
+    working_end   = parse_time(str(settings.get("working_hours_end",   "17:00")))
+    current_time  = moment.astimezone().time().replace(second=0, microsecond=0)
+
+    if working_start <= current_time <= working_end:
+        return True, ""
+
+    start_str = datetime.strptime(str(settings.get("working_hours_start", "09:00")), "%H:%M").strftime("%I:%M %p")
+    end_str   = datetime.strptime(str(settings.get("working_hours_end",   "17:00")), "%H:%M").strftime("%I:%M %p")
+
+    if current_time < working_start:
+        return False, f"Office not open yet. Working hours start at {start_str}."
+    return False, f"Working hours ended at {end_str}. Attendance is closed for today."
+
+
 def determine_status(check_in_time: datetime, settings: dict[str, Any]) -> str:
     working_start = parse_time(str(settings.get("working_hours_start", "09:00")))
     late_cutoff = (
@@ -130,36 +153,107 @@ def log_attendance(
     employee: dict[str, Any],
     confidence: float,
     settings: dict[str, Any],
-) -> tuple[str, datetime]:
+) -> tuple[str, str, datetime]:
+    """
+    Returns (attendance_status, action, timestamp)
+    attendance_status: "present" | "late" | "checked_out" | "duplicate" | "outside_hours" | "checkout_expired"
+    action: "check_in" | "check_out" | "duplicate" | "none"
+
+    Check-out window: only allowed between MIN_WORK_MINUTES and CHECKOUT_WINDOW_MINUTES after check-in.
+    """
     now = utc_now()
+    local_now = now.astimezone()
+    current_time = local_now.time()
     day_key = local_day_key(now)
     collection = attendance_collection(db)
+
+    working_start = parse_time(str(settings.get("working_hours_start", "09:00")))
+    working_end   = parse_time(str(settings.get("working_hours_end",   "17:00")))
+
     existing = collection.find_one(
         {"employee_id": employee["employee_id"], "attendance_date": day_key}
     )
+    is_pending_checkout = existing and existing.get("action") == "check_in"
 
-    if existing:
-        elapsed = now - existing["timestamp"]
-        if elapsed < timedelta(hours=1):
-            return "duplicate", existing["timestamp"]
+    # Block outside working hours unless a checkout is pending
+    if not (working_start <= current_time <= working_end) and not is_pending_checkout:
+        print(f"⏰ Outside working hours: {current_time} not in {working_start}–{working_end}")
+        return "outside_hours", "none", now
 
-    status_value = determine_status(now, settings)
-    payload = {
-        "employee_id": employee["employee_id"],
-        "name": employee["name"],
-        "department": employee["department"],
-        "timestamp": now,
-        "attendance_date": day_key,
-        "status": status_value,
-        "confidence": float(confidence),
-    }
-
-    if existing:
-        collection.update_one({"_id": existing["_id"]}, {"$set": payload})
-    else:
+    # ── No record yet → CHECK-IN ──────────────────────────────────────────
+    if not existing:
+        status_value = determine_status(now, settings)
+        payload = {
+            "employee_id": employee["employee_id"],
+            "name": employee["name"],
+            "department": employee["department"],
+            "timestamp": now,
+            "attendance_date": day_key,
+            "status": status_value,
+            "confidence": float(confidence),
+            "action": "check_in",
+            "check_in_time": now,
+            "check_out_time": None,
+            "work_duration_minutes": None,
+        }
         collection.insert_one(payload)
+        print(f"✅ Check-in: {employee['name']} at {now}")
+        return status_value, "check_in", now
 
-    return status_value, now
+    # ── Already has a record ──────────────────────────────────────────────
+    last_action = existing.get("action", "check_in")
+    check_in_time = existing.get("check_in_time")
+
+    # Already checked out today
+    if last_action == "check_out":
+        elapsed = now - existing.get("check_out_time", now)
+        if elapsed < timedelta(hours=6):
+            print(f"⚠️  Already checked out: {employee['name']}")
+            return "duplicate", "duplicate", existing.get("check_out_time", now)
+        # Re-check-in after 6 hours (next shift)
+        if not (working_start <= current_time <= working_end):
+            return "outside_hours", "none", now
+        status_value = determine_status(now, settings)
+        collection.update_one(
+            {"_id": existing["_id"]},
+            {"$set": {
+                "status": status_value,
+                "confidence": float(confidence),
+                "action": "check_in",
+                "check_in_time": now,
+                "check_out_time": None,
+                "work_duration_minutes": None,
+                "timestamp": now,
+            }}
+        )
+        return status_value, "check_in", now
+
+    # ── Checked in → validate checkout window ────────────────────────────
+    if last_action == "check_in" and check_in_time:
+        elapsed_minutes = (now - check_in_time).total_seconds() / 60
+
+        # Too soon — must wait at least MIN_WORK_MINUTES
+        if elapsed_minutes < MIN_WORK_MINUTES:
+            remaining = int(MIN_WORK_MINUTES - elapsed_minutes)
+            print(f"⚠️  Too soon: {elapsed_minutes:.1f} min elapsed, need {MIN_WORK_MINUTES}")
+            return "too_soon", "duplicate", check_in_time
+
+        # ✅ Checkout allowed — record it
+        work_duration = int(elapsed_minutes)
+        collection.update_one(
+            {"_id": existing["_id"]},
+            {"$set": {
+                "action": "check_out",
+                "check_out_time": now,
+                "work_duration_minutes": work_duration,
+                "confidence": float(confidence),
+                "timestamp": now,
+            }}
+        )
+        print(f"✅ Check-out: {employee['name']} — worked {work_duration} min")
+        return "checked_out", "check_out", now
+
+    return "duplicate", "duplicate", existing.get("timestamp", now)
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +288,7 @@ def register_face(payload: RegisterRequest, db: Database = Depends(get_db)) -> R
     if payload.department not in departments:
         raise HTTPException(status_code=400, detail="Department is not configured.")
 
+    # Step 1 — Extract embeddings
     embeddings = []
     for i, image_data in enumerate(payload.images):
         try:
@@ -207,6 +302,7 @@ def register_face(payload: RegisterRequest, db: Database = Depends(get_db)) -> R
                 detail=f"Image {i + 1} failed: {str(exc)}",
             ) from exc
 
+    # Step 2 — Validate consistency across angles
     if len(embeddings) >= 2:
         similarities = []
         for j in range(len(embeddings)):
@@ -222,63 +318,54 @@ def register_face(payload: RegisterRequest, db: Database = Depends(get_db)) -> R
 
     averaged_embedding = average_embeddings(embeddings)
 
-    existing_employees = list(employees_collection(db).find(
-        {"employee_id": {"$ne": payload.employee_id}}
-    ))
+    # Step 3 — Check duplicate Employee ID
+    employees = employees_collection(db)
+    existing_by_id = employees.find_one({"employee_id": payload.employee_id})
+    if existing_by_id:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Employee ID '{payload.employee_id}' is already registered as "
+                   f"'{existing_by_id['name']}'. Use a different ID or contact admin.",
+        )
 
-    if existing_employees:
+    # Step 4 — Check duplicate face
+    all_employees = list(employees.find())
+    if all_employees:
         candidate_pool = [
             (doc["employee_id"], embedding_from_json(doc["embedding_vector"]))
-            for doc in existing_employees
+            for doc in all_employees
         ]
         top_matches = top_k_matches(averaged_embedding, candidate_pool, k=1)
-
         if top_matches:
             best_id, best_score = top_matches[0]
             threshold = float(settings.get("confidence_threshold", 0.60))
-            print(f"🔍 Face similarity check — best match: {best_id} with score {best_score:.3f} (threshold: {threshold})")
-
+            print(f"🔍 Face similarity check: {best_id} → {best_score:.3f} (threshold: {threshold})")
             if best_score >= threshold:
-                matched_doc = next(
-                    (doc for doc in existing_employees if doc["employee_id"] == best_id), None
-                )
+                matched_doc = next((d for d in all_employees if d["employee_id"] == best_id), None)
                 matched_name = matched_doc["name"] if matched_doc else best_id
                 raise HTTPException(
                     status_code=409,
-                    detail=(
-                        f"This face is already registered as '{matched_name}' "
-                        f"(ID: {best_id}). Duplicate face registrations are not allowed."
-                    ),
+                    detail=f"This face is already registered as '{matched_name}' "
+                           f"(ID: {best_id}). Duplicate face registrations are not allowed.",
                 )
 
-    employees = employees_collection(db)
+    # Step 5 — Insert new employee
     now = utc_now()
-
-    write_result = employees.update_one(
-        {"employee_id": payload.employee_id},
-        {
-            "$set": {
-                "employee_id": payload.employee_id,
-                "name": payload.name,
-                "department": payload.department,
-                "embedding_vector": embeddings_to_json(averaged_embedding),
-                "image_count": len(embeddings),
-                "updated_at": now,
-            },
-            "$setOnInsert": {"created_at": now},
-        },
-        upsert=True,
-    )
+    employees.insert_one({
+        "employee_id": payload.employee_id,
+        "name": payload.name,
+        "department": payload.department,
+        "embedding_vector": embeddings_to_json(averaged_embedding),
+        "image_count": len(embeddings),
+        "created_at": now,
+        "updated_at": now,
+    })
     employee = employees.find_one({"employee_id": payload.employee_id})
-    status_value = "updated" if write_result.matched_count else "registered"
+    print(f"✅ Registered: {payload.name} (ID: {payload.employee_id})")
 
     return RegisterResponse(
-        status=status_value,
-        message=(
-            "Employee face data updated successfully."
-            if status_value == "updated"
-            else "Employee registered successfully."
-        ),
+        status="registered",
+        message="Employee registered successfully.",
         employee_id=str(employee["employee_id"]),
         name=str(employee["name"]),
         department=str(employee["department"]),
@@ -287,11 +374,12 @@ def register_face(payload: RegisterRequest, db: Database = Depends(get_db)) -> R
 
 
 # ---------------------------------------------------------------------------
-# Recognize
+# Recognize — supports check-in AND check-out
 # ---------------------------------------------------------------------------
 
 @app.post("/api/recognize", response_model=RecognizeResponse)
 def recognize_face(payload: RecognizeRequest, db: Database = Depends(get_db)) -> RecognizeResponse:
+    # Step 1 — decode and embed
     try:
         image = decode_base64_image(payload.image)
         candidate_embedding = get_face_embedding(image)
@@ -306,6 +394,7 @@ def recognize_face(payload: RecognizeRequest, db: Database = Depends(get_db)) ->
     if not employee_docs:
         return RecognizeResponse(status="unknown", timestamp=utc_now())
 
+    # Step 2 — match against all employees
     candidate_pool = [
         (doc["employee_id"], embedding_from_json(doc["embedding_vector"]))
         for doc in employee_docs
@@ -318,10 +407,12 @@ def recognize_face(payload: RecognizeRequest, db: Database = Depends(get_db)) ->
 
     best_employee_id, best_score = top_matches[0]
 
+    # Step 3 — hard threshold check
     if best_score < threshold:
         print(f"❌ Rejected: score {best_score:.3f} below threshold {threshold}")
         return RecognizeResponse(status="unknown", confidence=float(best_score), timestamp=utc_now())
 
+    # Step 4 — margin check
     if len(top_matches) > 1:
         second_score = top_matches[1][1]
         if (best_score - second_score) < margin:
@@ -330,11 +421,27 @@ def recognize_face(payload: RecognizeRequest, db: Database = Depends(get_db)) ->
     else:
         strict_threshold = max(threshold, 0.70)
         if best_score < strict_threshold:
-            print(f"❌ Rejected (single employee): score {best_score:.3f} below strict threshold {strict_threshold}")
+            print(f"❌ Rejected (single employee): score {best_score:.3f} below strict {strict_threshold}")
             return RecognizeResponse(status="unknown", confidence=float(best_score), timestamp=utc_now())
 
+    # Step 5 — enforce working hours window before logging
+    allowed, reason = is_within_working_hours(utc_now(), settings)
+    if not allowed:
+        print(f"⏰ Outside working hours: {reason}")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=reason,
+        )
+
+    # Step 6 — log check-in or check-out
     employee = next(doc for doc in employee_docs if doc["employee_id"] == best_employee_id)
-    attendance_status, logged_timestamp = log_attendance(db, employee, float(best_score), settings)
+    attendance_status, action, logged_timestamp = log_attendance(db, employee, float(best_score), settings)
+
+    # Fetch updated record to return check_in/check_out times
+    day_key = local_day_key(logged_timestamp)
+    att_record = attendance_collection(db).find_one(
+        {"employee_id": best_employee_id, "attendance_date": day_key}
+    )
 
     if attendance_status == "duplicate":
         return RecognizeResponse(
@@ -344,6 +451,9 @@ def recognize_face(payload: RecognizeRequest, db: Database = Depends(get_db)) ->
             confidence=float(best_score),
             timestamp=logged_timestamp,
             department=str(employee["department"]),
+            action=action,
+            check_in_time=att_record.get("check_in_time") if att_record else None,
+            check_out_time=att_record.get("check_out_time") if att_record else None,
         )
 
     return RecognizeResponse(
@@ -353,6 +463,9 @@ def recognize_face(payload: RecognizeRequest, db: Database = Depends(get_db)) ->
         confidence=float(best_score),
         timestamp=logged_timestamp,
         department=str(employee["department"]),
+        action=action,
+        check_in_time=att_record.get("check_in_time") if att_record else None,
+        check_out_time=att_record.get("check_out_time") if att_record else None,
     )
 
 
@@ -396,6 +509,10 @@ def get_attendance_records(
             timestamp=doc["timestamp"],
             status=str(doc["status"]),
             confidence=float(doc["confidence"]),
+            action=doc.get("action"),
+            check_in_time=doc.get("check_in_time"),
+            check_out_time=doc.get("check_out_time"),
+            work_duration_minutes=doc.get("work_duration_minutes"),
         )
         for doc in docs
     ]
@@ -424,27 +541,20 @@ def get_monthly_attendance_report(
     ensure_default_settings(db)
 
     _, last_day = calendar.monthrange(year, month)
-
-    # All calendar days in the month
     all_days_in_month = {
         date(year, month, day).isoformat()
         for day in range(1, last_day + 1)
     }
 
-    # Fetch holidays and subtract from working days
     holiday_docs = list(holidays_collection(db).find({
         "date": {"$regex": f"^{year}-{month:02d}"}
     }))
     holiday_dates = {doc["date"] for doc in holiday_docs}
     working_days_set = all_days_in_month - holiday_dates
 
-    # Only count days that have elapsed (don't count future days in current month)
     today = date.today()
     if year == today.year and month == today.month:
-        elapsed_days_set = {
-            d for d in working_days_set
-            if date.fromisoformat(d) <= today
-        }
+        elapsed_days_set = {d for d in working_days_set if date.fromisoformat(d) <= today}
     else:
         elapsed_days_set = working_days_set
 
@@ -467,36 +577,26 @@ def get_monthly_attendance_report(
         )
 
     month_prefix = f"{year}-{month:02d}"
-    att_query: dict[str, Any] = {
-        "attendance_date": {"$regex": f"^{month_prefix}"},
-    }
+    att_query: dict[str, Any] = {"attendance_date": {"$regex": f"^{month_prefix}"}}
     if department:
         att_query["department"] = department
 
     monthly_docs = list(attendance_collection(db).find(att_query))
-    print(f"📊 Found {len(monthly_docs)} records for {month_prefix}")
-
     attendance_by_employee: dict[str, dict[str, int]] = defaultdict(lambda: {"present": 0, "late": 0})
 
     for doc in monthly_docs:
         raw_date = doc.get("attendance_date", "")
         attendance_date = raw_date[:10] if isinstance(raw_date, str) else ""
-
-        # Only count days that are elapsed working days (excludes holidays & future days)
         if attendance_date not in elapsed_days_set:
             continue
-
         emp_id = str(doc.get("employee_id", "")).strip()
         if not emp_id:
             continue
-
         status_value = str(doc.get("status", "present")).strip().lower()
         if status_value == "late":
             attendance_by_employee[emp_id]["late"] += 1
         else:
             attendance_by_employee[emp_id]["present"] += 1
-
-    print(f"   ✅ Lookup: {dict(attendance_by_employee)}")
 
     items: list[MonthlyAttendanceReportItem] = []
     attendance_percentages: list[float] = []
@@ -504,16 +604,14 @@ def get_monthly_attendance_report(
     for employee in employees:
         emp_id = str(employee.get("employee_id", "")).strip()
         counts = attendance_by_employee.get(emp_id, {"present": 0, "late": 0})
-
-        present_days  = counts["present"]
-        late_days     = counts["late"]
+        present_days = counts["present"]
+        late_days = counts["late"]
         attended_days = present_days + late_days
-        absent_days   = max(total_working_days - attended_days, 0)
+        absent_days = max(total_working_days - attended_days, 0)
         attendance_percentage = (
             round((attended_days / total_working_days) * 100.0, 1)
             if total_working_days > 0 else 0.0
         )
-
         attendance_percentages.append(attendance_percentage)
         items.append(MonthlyAttendanceReportItem(
             employee_id=emp_id,
@@ -526,10 +624,7 @@ def get_monthly_attendance_report(
             attendance_percentage=attendance_percentage,
         ))
 
-    avg_pct = (
-        round(sum(attendance_percentages) / len(attendance_percentages), 1)
-        if attendance_percentages else 0.0
-    )
+    avg_pct = round(sum(attendance_percentages) / len(attendance_percentages), 1) if attendance_percentages else 0.0
 
     return MonthlyAttendanceReportResponse(
         month=month, year=year, department=department,
@@ -558,15 +653,10 @@ def get_holidays(
         query["date"] = {"$regex": f"^{year}-{month:02d}"}
     elif year:
         query["date"] = {"$regex": f"^{year}-"}
-
     docs = list(holidays_collection(db).find(query).sort("date", 1))
     return {
         "holidays": [
-            {
-                "date": doc["date"],
-                "name": doc["name"],
-                "holiday_type": doc.get("holiday_type", "public"),
-            }
+            {"date": doc["date"], "name": doc["name"], "holiday_type": doc.get("holiday_type", "public")}
             for doc in docs
         ],
         "total": len(docs),
@@ -576,18 +666,9 @@ def get_holidays(
 @app.post("/api/holidays", status_code=status.HTTP_201_CREATED)
 def add_holiday(payload: Holiday, db: Database = Depends(get_db)) -> dict[str, Any]:
     collection = holidays_collection(db)
-    existing = collection.find_one({"date": payload.date})
-    if existing:
-        raise HTTPException(
-            status_code=409,
-            detail=f"A holiday on {payload.date} already exists.",
-        )
-    collection.insert_one({
-        "date": payload.date,
-        "name": payload.name,
-        "holiday_type": payload.holiday_type,
-        "created_at": utc_now(),
-    })
+    if collection.find_one({"date": payload.date}):
+        raise HTTPException(status_code=409, detail=f"A holiday on {payload.date} already exists.")
+    collection.insert_one({"date": payload.date, "name": payload.name, "holiday_type": payload.holiday_type, "created_at": utc_now()})
     return {"status": "created", "date": payload.date, "name": payload.name}
 
 
@@ -617,6 +698,7 @@ def get_today_stats(db: Database = Depends(get_db)) -> TodayStats:
 
     present_count = len(today_records)
     late_count = sum(1 for doc in today_records if doc["status"] == "late")
+    checked_out_count = sum(1 for doc in today_records if doc.get("action") == "check_out" or doc.get("check_out_time") is not None)
     absent_count = max(employees_count - present_count, 0)
 
     recent_checkins = [
@@ -627,6 +709,7 @@ def get_today_stats(db: Database = Depends(get_db)) -> TodayStats:
             status=str(doc["status"]),
             timestamp=doc["timestamp"],
             confidence=float(doc["confidence"]),
+            action=doc.get("action"),
         )
         for doc in today_records[:8]
     ]
@@ -636,19 +719,18 @@ def get_today_stats(db: Database = Depends(get_db)) -> TodayStats:
         day = date.today() - timedelta(days=days_ago)
         day_key = day.isoformat()
         day_docs = list(attendance_collection(db).find({"attendance_date": day_key}))
-        weekly_trend.append(
-            {
-                "date": day_key,
-                "present": len(day_docs),
-                "late": sum(1 for doc in day_docs if doc["status"] == "late"),
-            }
-        )
+        weekly_trend.append({
+            "date": day_key,
+            "present": len(day_docs),
+            "late": sum(1 for doc in day_docs if doc["status"] == "late"),
+        })
 
     return TodayStats(
         total_registered=employees_count,
         present=present_count,
         absent=absent_count,
         late=late_count,
+        checked_out=checked_out_count,
         recent_checkins=recent_checkins,
         weekly_trend=weekly_trend,
     )
@@ -660,28 +742,25 @@ def get_today_stats(db: Database = Depends(get_db)) -> TodayStats:
 
 @app.get("/api/settings", response_model=SettingsResponse)
 def get_settings(db: Database = Depends(get_db)) -> SettingsResponse:
-    settings = ensure_default_settings(db)
-    return serialize_settings(settings)
+    return serialize_settings(ensure_default_settings(db))
 
 
 @app.put("/api/settings", response_model=SettingsResponse)
 def update_settings(payload: SettingsUpdate, db: Database = Depends(get_db)) -> SettingsResponse:
     collection = settings_collection(db)
-    now = utc_now()
-
     update_data = payload.model_dump()
-    update_data["updated_at"] = now
-
+    update_data["updated_at"] = utc_now()
     collection.update_one(
         {"key": SETTINGS_KEY},
-        {
-            "$set": update_data,
-            "$setOnInsert": {"key": SETTINGS_KEY},
-        },
+        {"$set": update_data, "$setOnInsert": {"key": SETTINGS_KEY}},
         upsert=True,
     )
     return serialize_settings(collection.find_one({"key": SETTINGS_KEY}))
 
+
+# ---------------------------------------------------------------------------
+# Employee monthly detail
+# ---------------------------------------------------------------------------
 
 @app.get("/api/attendance/employee-detail")
 def get_employee_monthly_detail(
@@ -691,73 +770,45 @@ def get_employee_monthly_detail(
     db: Database = Depends(get_db),
 ) -> dict[str, Any]:
     _, last_day = calendar.monthrange(year, month)
-
-    # Days elapsed so far (don't show future days)
     today = date.today()
-    if year == today.year and month == today.month:
-        elapsed_last_day = today.day
-    else:
-        elapsed_last_day = last_day
+    elapsed_last_day = today.day if (year == today.year and month == today.month) else last_day
+    all_days = [date(year, month, day).isoformat() for day in range(1, elapsed_last_day + 1)]
 
-    all_days = [
-        date(year, month, day).isoformat()
-        for day in range(1, elapsed_last_day + 1)
-    ]
-
-    # Fetch holidays
-    holiday_docs = list(holidays_collection(db).find({
-        "date": {"$regex": f"^{year}-{month:02d}"}
-    }))
+    holiday_docs = list(holidays_collection(db).find({"date": {"$regex": f"^{year}-{month:02d}"}}))
     holiday_dates = {doc["date"]: doc["name"] for doc in holiday_docs}
 
-    # Fetch this employee's attendance for the month
     month_prefix = f"{year}-{month:02d}"
     att_docs = list(attendance_collection(db).find({
         "employee_id": employee_id,
         "attendance_date": {"$regex": f"^{month_prefix}"},
     }))
+    att_by_date = {str(doc["attendance_date"])[:10]: doc for doc in att_docs}
 
-    # Build lookup: date -> record
-    att_by_date = {
-        str(doc["attendance_date"])[:10]: doc
-        for doc in att_docs
-    }
-
-    # Fetch employee info
     employee = employees_collection(db).find_one({"employee_id": employee_id})
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found.")
 
-    # Build day-wise breakdown
     day_records = []
     for day_str in all_days:
         if day_str in holiday_dates:
-            day_records.append({
-                "date": day_str,
-                "status": "holiday",
-                "holiday_name": holiday_dates[day_str],
-                "check_in_time": None,
-                "confidence": None,
-            })
+            day_records.append({"date": day_str, "status": "holiday", "holiday_name": holiday_dates[day_str], "check_in_time": None, "check_out_time": None, "work_duration_minutes": None, "confidence": None})
         elif day_str in att_by_date:
             doc = att_by_date[day_str]
-            ts = doc.get("timestamp")
-            check_in_time = ts.astimezone().strftime("%I:%M %p") if ts else None
+            ts = doc.get("check_in_time") or doc.get("timestamp")
+            check_in_str = ts.astimezone().strftime("%I:%M %p") if ts else None
+            co = doc.get("check_out_time")
+            check_out_str = co.astimezone().strftime("%I:%M %p") if co else None
             day_records.append({
                 "date": day_str,
                 "status": doc.get("status", "present"),
                 "holiday_name": None,
-                "check_in_time": check_in_time,
+                "check_in_time": check_in_str,
+                "check_out_time": check_out_str,
+                "work_duration_minutes": doc.get("work_duration_minutes"),
                 "confidence": round(float(doc.get("confidence", 0)) * 100, 1),
             })
         else:
-            day_records.append({
-                "date": day_str,
-                "status": "absent",
-                "holiday_name": None,
-                "check_in_time": None,
-                "confidence": None,
-            })
+            day_records.append({"date": day_str, "status": "absent", "holiday_name": None, "check_in_time": None, "check_out_time": None, "work_duration_minutes": None, "confidence": None})
 
     working_days = [d for d in all_days if d not in holiday_dates]
     attended = sum(1 for d in day_records if d["status"] in ("present", "late"))
